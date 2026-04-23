@@ -106,7 +106,7 @@ class StockScreener:
             if last:
                 start_str = (last + timedelta(days=1)).isoformat()
             else:
-                start_str = (date.today() - timedelta(days=90)).isoformat()
+                start_str = (date.today() - timedelta(days=365)).isoformat()
             groups.setdefault(start_str, []).append(symbol)
 
         logging.info(f"\u958b\u59cb\u65e5\u30b0\u30eb\u30fc\u30d7\u6570: {len(groups)}\u30d1\u30bf\u30fc\u30f3")
