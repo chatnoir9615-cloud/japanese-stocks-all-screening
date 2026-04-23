@@ -1,9 +1,8 @@
-“”“JPX全銘柄スクリーニング。
-
+"""JPX全銘柄スクリーニング。
 - JPXの銘柄リストを取得し、価格・テクニカル指標でフィルタリング
 - OHLCVキャッシュは MarketDataCache（market_cache.py）に統一
 - 銘柄リスト自体は symbols_cache.json に7日間キャッシュ
-  “””
+"""
 
 import json
 import logging
