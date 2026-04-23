@@ -5,46 +5,31 @@ import logging
 
 from google import genai
 
-_MAX_RETRIES = 3
-_RETRY_WAIT_BASE = 10  # 秒（503時は短縮してフォールバックモデルへ切り替え）
-
-# 503エラー時のフォールバックモデルリスト（順番に試行）
-_FALLBACK_MODELS = [
-    "gemini-2.0-flash-lite",
-    "gemini-2.5-flash-lite-preview-06-17",
-]
+_RETRY_WAIT = 10
 
 _SIGNAL_ICONS = {
-    "ADD_BUY":      "🟢買い乗せ",
-    "STOP_LOSS":    "🔴損切り",
-    "TAKE_PROFIT":  "🟡利確警告",
-    "WEEKEND_EXIT": "🏳️週末手仕舞い",
+    "ADD_BUY":      "\U0001f7e2\u8cb7\u3044\u4e57\u305b",
+    "STOP_LOSS":    "\U0001f534\u640d\u5207\u308a",
+    "TAKE_PROFIT":  "\U0001f7e1\u5229\u78ba\u8b66\u544a",
+    "WEEKEND_EXIT": "\U0001f3f3\ufe0f\u9031\u672b\u624b\u4ed5\u821e\u3044",
 }
 
 
 class AIAdvisor:
     def __init__(self, api_key_env: str = "GEMINI_API_KEY"):
         api_key = os.environ.get(api_key_env)
-        self.model_id = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+        self.model_id = "gemini-2.5-flash"
         if api_key:
             self.client = genai.Client(api_key=api_key)
-            logging.info(f"AIAdvisor初期化完了（キー変数: {api_key_env}）")
+            logging.info(f"AIAdvisor\u521d\u671f\u5316\u5b8c\u4e86\uff08\u30ad\u30fc\u5909\u6570: {api_key_env}\uff09")
         else:
             self.client = None
-            logging.warning(f"{api_key_env} が未設定です。")
+            logging.warning(f"{api_key_env} \u304c\u672a\u8a2d\u5b9a\u3067\u3059\u3002")
 
     def get_batch_advice(self, results_list: list, signals: list | None = None) -> str:
-        """
-        AIレポートを生成し、シグナルがある銘柄には末尾にシグナル情報を追記する。
-
-        Args:
-            results_list: 銘柄の分析結果リスト
-            signals: signal_detector が返したシグナルリスト（省略可）
-        """
         if not results_list:
             return ""
 
-        # シンボル → シグナルリスト のマップを作成
         signal_map: dict[str, list] = {}
         for sig in (signals or []):
             sym = sig.get("symbol", "")
@@ -53,18 +38,18 @@ class AIAdvisor:
         entries = []
         for r in results_list:
             try:
-                tag = f"【{r['category_label']}】"
+                tag = f"\u3010{r['category_label']}\u3011"
                 pl_info = ""
                 if r.get('is_held'):
                     pl_rate = r.get('pl_rate', 0.0)
-                    pl_info = f"(取得:{r['purchase_price']}円, 損益:{pl_rate}%)\n"
+                    pl_info = f"(\u53d6\u5f97:{r['purchase_price']}\u5186, \u640d\u76ca:{pl_rate}%)\n"
                     if pl_rate <= -5.0:
-                        tag = "【🚨損切り警告】" + tag
+                        tag = "\u3010\U0001f6a8\u640d\u5207\u308a\u8b66\u544a\u3011" + tag
 
                 entry = (
-                    f"■{r['name']}({r['symbol']}){tag}\n"
-                    f"  現在値:{r['price']}円 {pl_info}"
-                    f"  RSI:{r['metrics']['RSI']}, ATR:{r['metrics']['ATR']}円"
+                    f"\u25a0{r['name']}({r['symbol']}){tag}\n"
+                    f"  \u73fe\u5728\u5024:{r['price']}\u5186 {pl_info}"
+                    f"  RSI:{r['metrics']['RSI']}, ATR:{r['metrics']['ATR']}\u5186"
                 )
                 entries.append(entry)
             except KeyError as e:
@@ -75,39 +60,34 @@ class AIAdvisor:
             return ""
 
         prompt = f"""
-以下の指示に従い、各銘柄の投資助言を出力してください。
-前置き・挨拶・説明文は一切不要です。最初の銘柄から即座に出力を開始してください。
+\u4ee5\u4e0b\u306e\u6307\u793a\u306b\u5f93\u3044\u3001\u5404\u9298\u67c4\u306e\u6295\u8cc4\u52a9\u8a00\u3092\u51fa\u529b\u3057\u3066\u304f\u3060\u3055\u3044\u3002
+\u524d\u7f6e\u304d\u30fb\u6328\u62f6\u30fb\u8aac\u660e\u6587\u306f\u4e00\u5207\u4e0d\u8981\u3067\u3059\u3002\u6700\u521d\u306e\u9298\u67c4\u304b\u3089\u5373\u5ea7\u306b\u51fa\u529b\u3092\u958b\u59cb\u3057\u3066\u304f\u3060\u3055\u3044\u3002
 
-【出力フォーマット】
-■ [銘柄名] ([コード])
-[🔴信頼度A / 🔵信頼度B / 🟡信頼度C] [アクション]を推奨。
-🎯目標価格：[価格]円 / 🛡️損切り価格：[価格]円
-[テクニカル的理由。RSIやATRに触れること。100文字以内。]
+\u3010\u51fa\u529b\u30d5\u30a9\u30fc\u30de\u30c3\u30c8\u3011
+\u25a0 [\u9298\u67c4\u540d] ([\u30b3\u30fc\u30c9])
+[\U0001f534\u4fe1\u983c\u5ea6A / \U0001f535\u4fe1\u983c\u5ea6B / \U0001f7e1\u4fe1\u983c\u5ea6C] [\u30a2\u30af\u30b7\u30e7\u30f3]\u3092\u63a8\u5968\u3002
+\U0001f3af\u76ee\u6a19\u4fa1\u683c\uff1a[\u4fa1\u683c]\u5186 / \U0001f6e1\ufe0f\u640d\u5207\u308a\u4fa1\u683c\uff1a[\u4fa1\u683c]\u5186
+[\u30c6\u30af\u30cb\u30ab\u30eb\u7684\u7406\u7531\u3002RSI\u3084ATR\u306b\u89e6\u308c\u308b\u3053\u3068\u3002100\u6587\u5b57\u4ee5\u5185\u3002]
 
-【算出・判定ルール】
-1. 損切り価格：保有株で含み益がある場合は「取得単価」、それ以外は「現在値の-5%」。
-2. 目標価格：ATRを考慮した上昇目処。
-3. 信頼度の絵文字は必ず1つだけ（🔴🔵🟡のいずれか1つ）。
+\u3010\u7b97\u51fa\u30fb\u5224\u5b9a\u30eb\u30fc\u30eb\u3011
+1. \u640d\u5207\u308a\u4fa1\u683c\uff1a\u4fdd\u6709\u682a\u3067\u542b\u307f\u76ca\u304c\u3042\u308b\u5834\u5408\u306f\u300c\u53d6\u5f97\u5358\u4fa1\u300d\u3001\u305d\u308c\u4ee5\u5916\u306f\u300c\u73fe\u5728\u5024\u306e-5%\u300d\u3002
+2. \u76ee\u6a19\u4fa1\u683c\uff1aATR\u3092\u8003\u616e\u3057\u305f\u4e0a\u6607\u76ee\u51e6\u3002
+3. \u4fe1\u983c\u5ea6\u306e\u7d75\u6587\u5b57\u306f\u5fc5\u305a1\u3064\u3060\u3051\uff08\U0001f534\U0001f535\U0001f7e1\u306e\u3044\u305a\u308c\u304b1\u3064\uff09\u3002
 
-【銘柄リスト】
-{"\n".join(entries)}
+\u3010\u9298\u67c4\u30ea\u30b9\u30c8\u3011
+{chr(10).join(entries)}
 """
         ai_text = self._safe_generate(prompt)
 
-        # AI解析が失敗した場合は簡易レポートにフォールバック
-        if "【⚠️ Gemini APIエラー" in ai_text:
-            logging.warning("AI解析失敗: 簡易レポートにフォールバック")
+        if "\u3010\u26a0\ufe0f Gemini API\u30a8\u30e9\u30fc" in ai_text:
+            logging.warning("AI\u89e3\u6790\u5931\u6557: \u7c21\u6613\u30ec\u30dd\u30fc\u30c8\u306b\u30d5\u30a9\u30fc\u30eb\u30d0\u30c3\u30af")
             ai_text = self._build_fallback_report(results_list)
 
-        # シグナルをAIレポートの該当銘柄末尾に追記
         ai_text = self._append_signals(ai_text, results_list, signal_map)
         return ai_text
 
     def _build_fallback_report(self, results_list: list) -> str:
-        """AI解析失敗時の簡易テキストレポートを生成する。
-        シグナル・現在値・RSI・ATR・損益率は表示し、AIコメントは省略。
-        """
-        lines = ["⚠️ AI解析失敗のため簡易レポートを表示しています\n"]
+        lines = ["\u26a0\ufe0f AI\u89e3\u6790\u5931\u6557\u306e\u305f\u3081\u7c21\u6613\u30ec\u30dd\u30fc\u30c8\u3092\u8868\u793a\u3057\u3066\u3044\u307e\u3059\n"]
         for r in results_list:
             try:
                 name    = r.get("name", r.get("symbol", ""))
@@ -117,11 +97,11 @@ class AIAdvisor:
                 atr     = r.get("metrics", {}).get("ATR", "-")
                 pl_rate = r.get("pl_rate", None)
 
-                line = f"■{name}({symbol})\n"
-                line += f"  現在値: {price}円"
+                line = f"\u25a0{name}({symbol})\n"
+                line += f"  \u73fe\u5728\u5024: {price}\u5186"
                 if pl_rate is not None:
-                    line += f" / 損益: {pl_rate}%"
-                line += f"\n  RSI: {rsi} / ATR: {atr}円"
+                    line += f" / \u640d\u76ca: {pl_rate}%"
+                line += f"\n  RSI: {rsi} / ATR: {atr}\u5186"
                 lines.append(line)
             except Exception:
                 continue
@@ -133,15 +113,10 @@ class AIAdvisor:
         results_list: list,
         signal_map: dict[str, list],
     ) -> str:
-        """AIレポートの各銘柄ブロック先頭（■行の直後）にシグナル情報を挿入し、
-        目標価格・損切り価格に現在値からの乖離率を付加する。
-        """
         if not signal_map and not results_list:
             return ai_text
 
-        # シンボル → 銘柄データ のマップ（乖離率計算用）
         result_map = {r["symbol"]: r for r in results_list}
-
         lines = ai_text.split("\n")
         output = []
         current_symbol = None
@@ -150,12 +125,10 @@ class AIAdvisor:
         while i < len(lines):
             line = lines[i]
 
-            # 銘柄行（■ で始まる行）を検出
-            if line.startswith("■"):
+            if line.startswith("\u25a0"):
                 current_symbol = self._extract_symbol(line, results_list)
                 output.append(line)
 
-                # シグナルがある銘柄はAIコメントの前に挿入
                 if current_symbol and current_symbol in signal_map:
                     r = result_map.get(current_symbol, {})
                     purchase = r.get("purchase_price", 0)
@@ -168,37 +141,41 @@ class AIAdvisor:
 
                         if sig["type"] == "STOP_LOSS":
                             pl_yen = round((price - purchase) * quantity, 0) if purchase > 0 and quantity > 0 else ""
-                            pl_yen_str = f"{int(pl_yen):+,}円({pl_rate}%)" if pl_yen != "" else f"{pl_rate}%"
+                            pl_yen_str = f"{int(pl_yen):+,}\u5186({pl_rate}%)" if pl_yen != "" else f"{pl_rate}%"
                             loss_reason = sig.get("reasons", [""])[0]
                             output.append(
-                                f"⚠️ 【ルール】{icon}｜現在値: {price}円 / 損益: {pl_yen_str}\n"
-                                f"\t根拠：{loss_reason}"
+                                f"\u26a0\ufe0f \u3010\u30eb\u30fc\u30eb\u3011{icon}\uff5c\u73fe\u5728\u5024: {price}\u5186 / \u640d\u76ca: {pl_yen_str}\n"
+                                f"\t\u6839\u62e0\uff1a{loss_reason}"
                             )
                         elif sig["type"] in ("TAKE_PROFIT", "WEEKEND_EXIT"):
-                            reasons = "、".join(sig.get("reasons", []))
-                            pl_str = f"損益: {pl_rate}%" if pl_rate != "" else ""
+                            reasons = "\u3001".join(sig.get("reasons", []))
+                            pl_str = f"\u640d\u76ca: {pl_rate}%" if pl_rate != "" else ""
                             output.append(
-                                f"⚠️ 【ルール】{icon}｜{pl_str}\n"
-                                f"\t根拠：{reasons}"
+                                f"\u26a0\ufe0f \u3010\u30eb\u30fc\u30eb\u3011{icon}\uff5c{pl_str}\n"
+                                f"\t\u6839\u62e0\uff1a{reasons}"
                             )
-                        else:  # ADD_BUY
-                            reasons = "、".join(sig.get("reasons", []))
+                        else:
+                            reasons = "\u3001".join(sig.get("reasons", []))
                             output.append(
-                                f"✅ 【ルール】{icon}\n"
-                                f"\t根拠：{reasons}"
+                                f"\u2705 \u3010\u30eb\u30fc\u30eb\u3011{icon}\n"
+                                f"\t\u6839\u62e0\uff1a{reasons}"
                             )
 
-            # 🎯目標価格・🛡️損切り価格に乖離率を付加
-            elif current_symbol and ("🎯目標価格" in line or "🛡️損切り価格" in line):
+            elif current_symbol and ("\U0001f3af\u76ee\u6a19\u4fa1\u683c" in line or "\U0001f6e1\ufe0f\u640d\u5207\u308a\u4fa1\u683c" in line):
                 r = result_map.get(current_symbol, {})
                 current_price = r.get("price", 0)
                 if current_price > 0:
                     line = self._add_rate_to_prices(line, current_price)
                 output.append(line)
 
-            # AI根拠テキスト: 信頼度行・目標価格行・空行・シグナル行以外の通常テキスト
-            elif current_symbol and line.strip()                     and not line.startswith("■")                     and not line.startswith("⚠️")                     and not line.startswith("✅")                     and not line.startswith("🎯")                     and not line.startswith("🛡")                     and not re.search(r'[🔴🔵🟡]信頼度', line):
-                output.append(f"\t根拠：{line.strip()}")
+            elif current_symbol and line.strip() \
+                    and not line.startswith("\u25a0") \
+                    and not line.startswith("\u26a0\ufe0f") \
+                    and not line.startswith("\u2705") \
+                    and not line.startswith("\U0001f3af") \
+                    and not line.startswith("\U0001f6e1") \
+                    and not re.search(r'[\U0001f534\U0001f535\U0001f7e1]\u4fe1\u983c\u5ea6', line):
+                output.append(f"\t\u6839\u62e0\uff1a{line.strip()}")
 
             else:
                 output.append(line)
@@ -209,23 +186,18 @@ class AIAdvisor:
 
     @staticmethod
     def _add_rate_to_prices(line: str, current_price: float) -> str:
-        """目標価格・損切り価格の数値に現在値からの乖離率を付加する。
-        例: 5990円 → 5990円(+3.28%)
-        """
         import re
 
         def replace_price(m):
             price_val = float(m.group(1).replace(",", ""))
             rate = round((price_val - current_price) / current_price * 100, 2)
             sign = "+" if rate >= 0 else ""
-            return f"{m.group(1)}円({sign}{rate}%)"
+            return f"{m.group(1)}\u5186({sign}{rate}%)"
 
-        # 「数値円」のパターンを検出して乖離率を追加（既に乖離率がついている場合はスキップ）
-        return re.sub(r"([\d,]+(?:\.\d+)?)円(?!\()", replace_price, line)
+        return re.sub(r"([\d,]+(?:\.\d+)?)\u5186(?!\()", replace_price, line)
 
     @staticmethod
     def _extract_symbol(line: str, results_list: list) -> str | None:
-        """銘柄行からシンボルを抽出する。results_list と照合して特定。"""
         for r in results_list:
             name   = r.get("name", "")
             symbol = r.get("symbol", "")
@@ -236,39 +208,24 @@ class AIAdvisor:
         return None
 
     def _safe_generate(self, prompt: str) -> str:
-        """Gemini APIを呼び出す。503エラー時はフォールバックモデルに即切り替え。"""
         if not self.client:
-            return "（AI解析スキップ：APIキー未設定）"
+            return "（AI\u89e3\u6790\u30b9\u30ad\u30c3\u30d7\uff1aAPI\u30ad\u30fc\u672a\u8a2d\u5b9a\uff09"
 
-        # 試行するモデルリスト: メインモデル → フォールバックモデル順
-        models_to_try = [self.model_id] + _FALLBACK_MODELS
-        last_error_msg = ""
-
-        for i, model in enumerate(models_to_try):
+        for attempt in range(1, 4):
             try:
-                if i > 0:
-                    logging.info(f"フォールバック: {models_to_try[i-1]} → {model} に切り替え")
-                res = self.client.models.generate_content(model=model, contents=prompt)
-                if i > 0:
-                    logging.info(f"フォールバックモデル {model} で成功")
+                res = self.client.models.generate_content(
+                    model=self.model_id,
+                    contents=prompt
+                )
                 text = res.text.strip()
-                text = re.sub(r'(?<![🔴🔵🟡])信頼度A', '📖【AI分析】🔴信頼度A', text)
-                text = re.sub(r'(?<![🔴🔵🟡])信頼度B', '📖【AI分析】🔵信頼度B', text)
-                text = re.sub(r'(?<![🔴🔵🟡])信頼度C', '📖【AI分析】🟡信頼度C', text)
+                text = re.sub(r'(?<![\U0001f534\U0001f535\U0001f7e1])\u4fe1\u983c\u5ea6A', '\U0001f4d6\u3010AI\u5206\u6790\u3011\U0001f534\u4fe1\u983c\u5ea6A', text)
+                text = re.sub(r'(?<![\U0001f534\U0001f535\U0001f7e1])\u4fe1\u983c\u5ea6B', '\U0001f4d6\u3010AI\u5206\u6790\u3011\U0001f535\u4fe1\u983c\u5ea6B', text)
+                text = re.sub(r'(?<![\U0001f534\U0001f535\U0001f7e1])\u4fe1\u983c\u5ea6C', '\U0001f4d6\u3010AI\u5206\u6790\u3011\U0001f7e1\u4fe1\u983c\u5ea6C', text)
                 return text
             except Exception as e:
                 err_str = str(e)
-                last_error_msg = f"エラー型: {type(e).__name__}\n内容: {err_str}"
-                is_503 = "503" in err_str or "Service Unavailable" in err_str or "overloaded" in err_str.lower()
+                logging.warning(f"AI\u89e3\u6790\u30a8\u30e9\u30fc (\u8a66\u884c{attempt}/3) [{self.model_id}]: {e}")
+                if attempt < 3:
+                    time.sleep(_RETRY_WAIT)
 
-                if is_503 and i < len(models_to_try) - 1:
-                    # 503の場合は短い待機後にフォールバックモデルへ
-                    logging.warning(f"503エラー [{model}]: フォールバックモデルに切り替えます")
-                    time.sleep(_RETRY_WAIT_BASE)
-                else:
-                    # 503以外のエラーまたは全モデル失敗時
-                    logging.warning(f"AI解析エラー [{model}]: {e}")
-                    if i < len(models_to_try) - 1:
-                        time.sleep(_RETRY_WAIT_BASE)
-
-        return f"【⚠️ Gemini APIエラー（全モデル失敗）】\n{last_error_msg}"
+        return f"\u3010\u26a0\ufe0f Gemini API\u30a8\u30e9\u30fc\uff08\u5168\u8a66\u884c\u5931\u6557\uff09\u3011\n{err_str}"
