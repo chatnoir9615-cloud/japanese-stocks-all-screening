@@ -1,0 +1,10 @@
+yfinance>=0.2.40
+pandas>=2.0.0
+pandas-ta
+openpyxl       # JPX銘柄リスト(.xls)の読み込みに必要
+xlrd           # 同上（旧形式.xls対応）
+google-genai>=1.0.0
+line-bot-sdk>=3.10.0
+python-dotenv>=1.0.0
+jpholiday      # 日本の祝日判定（東証営業日カレンダー）
+ 
