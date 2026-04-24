@@ -1,3 +1,10 @@
+"""JPX全銘柄スクリーニング。
+
+- JPXの銘柄リストを取得し、価格・テクニカル指標でフィルタリング
+- OHLCVキャッシュは MarketDataCache（market_cache.py）に統一
+- 銘柄リスト自体は symbols_cache.json に7日間キャッシュ
+"""
+
 import json
 import logging
 import os
@@ -15,6 +22,10 @@ _SYMBOL_TTL_DAYS    = 7
 _MIN_VOLUME         = 50_000
 _BATCH_SIZE         = 50
 _BATCH_SLEEP        = 2
+# rebuild_cacheモードで一度に取得する期間（日数）
+# 4回実行で1年分をカバーするため1回あたり約90日
+# ただし初回（キャッシュなし）は REBUILD_PERIOD_DAYS を起点とする
+_REBUILD_PERIOD_DAYS = 365  # 1年分を上限として取得
 
 _JPX_LIST_URL = (
     "https://www.jpx.co.jp/markets/statistics-equities/misc/"
@@ -26,15 +37,18 @@ class StockScreener:
     def __init__(self, cache: MarketDataCache | None = None):
         self.cache = cache or MarketDataCache()
 
+    # ── 銘柄リスト取得 ───────────────────────────────────────────────────
+
     def get_all_symbols(self) -> tuple[list[str], dict[str, str]]:
+        """JPX全銘柄のシンボルリストと名称マップを返す。7日間キャッシュ。"""
         cached = self._load_symbols_cache()
         if cached:
             return cached["symbols"], cached.get("names", {})
 
         try:
             df = pd.read_excel(_JPX_LIST_URL, header=0)
-            code_col = [c for c in df.columns if "\u30b3\u30fc\u30c9" in str(c)][0]
-            name_cols = [c for c in df.columns if "\u9280\u67c4\u540d" in str(c) or "\u540d\u79f0" in str(c)]
+            code_col = [c for c in df.columns if "コード" in str(c)][0]
+            name_cols = [c for c in df.columns if "銘柄名" in str(c) or "名称" in str(c)]
 
             codes   = df[code_col].dropna().astype(str).str.strip()
             symbols = [f"{code}.T" for code in codes]
@@ -44,26 +58,38 @@ class StockScreener:
                 for code, name in zip(codes, df[name_cols[0]].fillna("")):
                     names[f"{code}.T"] = str(name).strip()
 
-            logging.info(f"JPX\u9298\u67c4\u30ea\u30b9\u30c8\u53d6\u5f97\u5b8c\u4e86: {len(symbols)}\u9298\u67c4")
+            logging.info(f"JPX銘柄リスト取得完了: {len(symbols)}銘柄")
             self._save_symbols_cache(symbols, names)
             return symbols, names
 
         except Exception as e:
-            logging.error(f"JPX\u9298\u67c4\u30ea\u30b9\u30c8\u53d6\u5f97\u5931\u6557: {e}")
+            logging.error(f"JPX銘柄リスト取得失敗: {e}")
             return [], {}
 
+    # ── キャッシュ構築のみ（rebuild_cacheモード用） ──────────────────────
+
     def build_cache_only(self, exclude_symbols: set[str]) -> None:
+        """全銘柄のOHLCVキャッシュ構築のみ実行。AI解析・LINE通知は行わない。
+
+        rebuild_cacheモード専用。needs_update の判定に依存せず、
+        各銘柄のキャッシュ最終日の翌日から現在までを強制的に差分取得する。
+        キャッシュが存在しない銘柄は _REBUILD_PERIOD_DAYS 日前を起点とする。
+        4回実行すれば約1年分のキャッシュが蓄積される設計。
+        """
         symbols, _ = self.get_all_symbols()
         if not symbols:
-            logging.error("\u9298\u67c4\u30ea\u30b9\u30c8\u53d6\u5f97\u5931\u6557\u3002\u30ad\u30e3\u30c3\u30b7\u30e5\u69cb\u7bc9\u3092\u4e2d\u65ad\u3057\u307e\u3059\u3002")
+            logging.error("銘柄リスト取得失敗。キャッシュ構築を中断します。")
             return
 
         exclude_normalized = {s if s.endswith(".T") else f"{s}.T" for s in exclude_symbols}
         targets = [s for s in symbols if s not in exclude_normalized]
-        logging.info(f"\u30ad\u30e3\u30c3\u30b7\u30e5\u69cb\u7bc9\u5bfe\u8c61: {len(targets)}\u9298\u67c4\uff08\u9664\u5916\u5f8c\uff09")
+        logging.info(f"キャッシュ構築対象: {len(targets)}銘柄（除外後）")
 
-        self._batch_fetch(targets)
-        logging.info("\u30ad\u30e3\u30c3\u30b7\u30e5\u69cb\u7bc9\u30d0\u30c3\u30c1\u51e6\u7406\u5b8c\u4e86")
+        # rebuild_cacheモードは needs_update に関わらず全銘柄を強制取得
+        self._batch_fetch_rebuild(targets)
+        logging.info("キャッシュ構築バッチ処理完了")
+
+    # ── メインスクリーニング ─────────────────────────────────────────────
 
     def screen(
         self,
@@ -75,10 +101,12 @@ class StockScreener:
         if not symbols:
             return []
 
+        # 除外銘柄を .T 付きに正規化して除外
         exclude_normalized = {s if s.endswith(".T") else f"{s}.T" for s in exclude_symbols}
         targets = [s for s in symbols if s not in exclude_normalized]
-        logging.info(f"\u30b9\u30af\u30ea\u30fc\u30cb\u30f3\u30b0\u5bfe\u8c61: {len(targets)}\u9298\u67c4\uff08\u9664\u5916\u5f8c\uff09")
+        logging.info(f"スクリーニング対象: {len(targets)}銘柄（除外後）")
 
+        # 通常スクリーニングは差分取得のみ（needs_update=Trueの銘柄のみ対象）
         self._batch_fetch(targets)
 
         candidates = []
@@ -88,66 +116,119 @@ class StockScreener:
                 candidates.append(result)
 
         top = sorted(candidates, key=lambda x: x["score"], reverse=True)[:top_n]
-        logging.info(f"\u30b9\u30af\u30ea\u30fc\u30cb\u30f3\u30b0\u5b8c\u4e86: {len(candidates)}\u9298\u67c4\u4e2d \u4e0a\u4f4d{len(top)}\u9298\u67c4\u3092\u9078\u51fa")
+        logging.info(f"スクリーニング完了: {len(candidates)}銘柄中 上位{len(top)}銘柄を選出")
         return top
 
+    # ── バッチ価格取得（通常モード：差分のみ） ───────────────────────────
+
     def _batch_fetch(self, symbols: list[str]) -> None:
+        """差分取得が必要な銘柄をバッチで yfinance から取得しキャッシュに保存する。
+        通常スクリーニングモード用。needs_update=True の銘柄のみ対象。
+        """
         stale = [s for s in symbols if self.cache.needs_update(s)]
-        logging.info(f"\u5dee\u5206\u53d6\u5f97\u5bfe\u8c61: {len(stale)}\u9298\u67c4 / {len(symbols)}\u9298\u67c4\u4e2d")
+        logging.info(f"差分取得対象: {len(stale)}銘柄 / {len(symbols)}銘柄中")
 
         if not stale:
             return
 
-        end_str = date.today().isoformat()
+        # キャッシュ済み銘柄は last_date の翌日から、未取得銘柄は90日前から
+        # （通常モードは直近データの補完が目的のため90日で十分）
+        last_dates = [self.cache.last_date(s) for s in stale if self.cache.last_date(s)]
+        if last_dates:
+            start_date = min(last_dates) + timedelta(days=1)
+        else:
+            start_date = date.today() - timedelta(days=90)
 
-        groups: dict[str, list[str]] = {}
-        for symbol in stale:
-            last = self.cache.last_date(symbol)
-            if last:
-                start_str = (last + timedelta(days=1)).isoformat()
-            else:
-                start_str = (date.today() - timedelta(days=365)).isoformat()
-            groups.setdefault(start_str, []).append(symbol)
+        self._download_and_cache(stale, start_date)
 
-        logging.info(f"\u958b\u59cb\u65e5\u30b0\u30eb\u30fc\u30d7\u6570: {len(groups)}\u30d1\u30bf\u30fc\u30f3")
+    # ── バッチ価格取得（rebuild_cacheモード：強制全件） ──────────────────
 
-        total_processed = 0
-        for start_str, group in sorted(groups.items()):
-            if start_str > end_str:
-                logging.info(f"\u30b9\u30ad\u30c3\u30d7\uff08\u958b\u59cb\u65e5\u304c\u672a\u6765\uff09: {start_str} / {len(group)}\u9298\u67c4")
-                total_processed += len(group)
+    def _batch_fetch_rebuild(self, symbols: list[str]) -> None:
+        """rebuild_cacheモード専用バッチ取得。
+
+        needs_update に関わらず全銘柄を対象とし、各銘柄ごとに
+        「キャッシュ最終日の翌日」を起点として差分取得する。
+        キャッシュが存在しない銘柄は _REBUILD_PERIOD_DAYS 日前を起点とする。
+
+        これにより4回のrebuild_cacheで約1年分が蓄積される：
+          1回目: キャッシュなし → 365日前〜現在を取得（初回は365日分）
+          2〜4回目: 前回取得済みの翌日〜現在を追加取得
+        """
+        today = date.today()
+
+        # 銘柄を「キャッシュあり」「キャッシュなし」に分けて処理
+        no_cache   = [s for s in symbols if self.cache.last_date(s) is None]
+        has_cache  = [s for s in symbols if self.cache.last_date(s) is not None]
+
+        # キャッシュなし銘柄: _REBUILD_PERIOD_DAYS 日前から一括取得
+        if no_cache:
+            start_date = today - timedelta(days=_REBUILD_PERIOD_DAYS)
+            logging.info(
+                f"[rebuild] キャッシュなし銘柄: {len(no_cache)}銘柄 "
+                f"({start_date} 〜 {today})"
+            )
+            self._download_and_cache(no_cache, start_date)
+
+        # キャッシュあり銘柄: 各銘柄の最終日翌日から差分取得
+        # needs_update=False（最新済み）の銘柄はスキップ
+        stale_with_cache = [
+            s for s in has_cache if self.cache.needs_update(s)
+        ]
+        if stale_with_cache:
+            last_dates = [self.cache.last_date(s) for s in stale_with_cache]
+            start_date = min(last_dates) + timedelta(days=1)
+            logging.info(
+                f"[rebuild] 差分取得対象: {len(stale_with_cache)}銘柄 "
+                f"({start_date} 〜 {today})"
+            )
+            self._download_and_cache(stale_with_cache, start_date)
+
+        already_fresh = len(has_cache) - len(stale_with_cache)
+        if already_fresh > 0:
+            logging.info(f"[rebuild] 最新済みのためスキップ: {already_fresh}銘柄")
+
+    # ── 共通ダウンロード処理 ─────────────────────────────────────────────
+
+    def _download_and_cache(self, symbols: list[str], start_date: date) -> None:
+        """指定銘柄リストを start_date〜今日でバッチダウンロードしキャッシュに保存する。"""
+        start_str = start_date.isoformat()
+        end_str   = date.today().isoformat()
+
+        if start_str > end_str:
+            logging.info("取得範囲なし（start_date が今日以降）。スキップ。")
+            return
+
+        for i in range(0, len(symbols), _BATCH_SIZE):
+            batch = symbols[i : i + _BATCH_SIZE]
+            try:
+                raw = yf.download(
+                    tickers=batch,
+                    start=start_str,
+                    end=end_str,
+                    interval="1d",
+                    group_by="ticker",
+                    auto_adjust=True,
+                    progress=False,
+                    threads=True,
+                )
+            except Exception as e:
+                logging.warning(f"バッチダウンロード失敗 [{i}〜{i+_BATCH_SIZE}]: {e}")
+                time.sleep(_BATCH_SLEEP)
                 continue
 
-            for i in range(0, len(group), _BATCH_SIZE):
-                batch = group[i : i + _BATCH_SIZE]
+            for symbol in batch:
                 try:
-                    raw = yf.download(
-                        tickers=batch,
-                        start=start_str,
-                        end=end_str,
-                        interval="1d",
-                        group_by="ticker",
-                        auto_adjust=True,
-                        progress=False,
-                        threads=True,
-                    )
-                except Exception as e:
-                    logging.warning(f"\u30d0\u30c3\u30c1\u30c0\u30a6\u30f3\u30ed\u30fc\u30c9\u5931\u6557 [{i}\uff5e{i+_BATCH_SIZE}]: {e}")
-                    time.sleep(_BATCH_SLEEP)
+                    df = raw[symbol].copy() if len(batch) > 1 else raw.copy()
+                    df = df.dropna()
+                    if not df.empty:
+                        self.cache.update(symbol, df)
+                except Exception:
                     continue
 
-                for symbol in batch:
-                    try:
-                        df = raw[symbol].copy() if len(batch) > 1 else raw.copy()
-                        df = df.dropna()
-                        if not df.empty:
-                            self.cache.update(symbol, df)
-                    except Exception:
-                        continue
+            logging.info(f"バッチ取得完了: {i+len(batch)}/{len(symbols)}")
+            time.sleep(_BATCH_SLEEP)
 
-                total_processed += len(batch)
-                logging.info(f"\u30d0\u30c3\u30c1\u53d6\u5f97\u5b8c\u4e86: {total_processed}/{len(stale)}")
-                time.sleep(_BATCH_SLEEP)
+    # ── 個別銘柄評価 ────────────────────────────────────────────────────
 
     def _evaluate(
         self,
@@ -176,11 +257,13 @@ class StockScreener:
             ma25_diff    = round(((current_price - ma25) / ma25) * 100, 2)
             volume_ratio = round(float(df["Volume"].iloc[-1]) / avg_volume, 2)
 
+            # MA25上向きフィルター: 5日前より現在のMA25が高い場合のみ通過
             if len(ma25_series.dropna()) >= 6:
                 ma25_5d_ago = ma25_series.dropna().iloc[-6]
                 if ma25 <= ma25_5d_ago:
                     return None
 
+            # スコアリング（出来高比・RSI・MA25乖離の複合）
             score = 0.0
             score += min(volume_ratio / 2.0, 1.0) * 40
             if 25 <= rsi <= 45:
@@ -195,22 +278,24 @@ class StockScreener:
                 "name":           display_name,
                 "price":          current_price,
                 "score":          round(score, 2),
-                "category_label": "\u30b9\u30af\u30ea\u30fc\u30cb\u30f3\u30b0",
+                "category_label": "スクリーニング",
                 "is_held":        False,
                 "purchase_price": None,
                 "pl_rate":        0,
                 "metrics": {
                     "RSI":      round(float(rsi), 1),
                     "ATR":      round(float(atr), 1),
-                    "MA25\u4e56\u9e62": ma25_diff,
-                    "\u7a81\u7834":     current_price > df["High"].rolling(20).max().iloc[-2],
-                    "\u51fa\u6765\u9ad8\u6bd4": volume_ratio,
+                    "MA25乖離": ma25_diff,
+                    "突破":     current_price > df["High"].rolling(20).max().iloc[-2],
+                    "出来高比": volume_ratio,
                 },
-                "fundamentals": {"PBR": 0, "\u5229\u56de\u308a": "0.00%"},
+                "fundamentals": {"PBR": 0, "利回り": "0.00%"},
             }
         except Exception as e:
-            logging.debug(f"\u30b9\u30ad\u30c3\u30d7 [{symbol}]: {e}")
+            logging.debug(f"スキップ [{symbol}]: {e}")
             return None
+
+    # ── 銘柄リストキャッシュ I/O ────────────────────────────────────────
 
     def _load_symbols_cache(self) -> dict | None:
         if not os.path.exists(_SYMBOLS_CACHE_PATH):
@@ -220,12 +305,12 @@ class StockScreener:
                 data = json.load(f)
             cached_at = date.fromisoformat(data["cached_at"])
             if (date.today() - cached_at).days > _SYMBOL_TTL_DAYS:
-                logging.info("\u9298\u67c4\u30ea\u30b9\u30c8\u30ad\u30e3\u30c3\u30b7\u30e5\u671f\u9650\u5207\u308c\u3002\u518d\u53d6\u5f97\u3057\u307e\u3059\u3002")
+                logging.info("銘柄リストキャッシュ期限切れ。再取得します。")
                 return None
-            logging.info(f"\u9298\u67c4\u30ea\u30b9\u30c8\u3092\u30ad\u30e3\u30c3\u30b7\u30e5\u304b\u3089\u8aad\u307f\u8fbc\u307f: {len(data['symbols'])}\u9298\u67c4")
+            logging.info(f"銘柄リストをキャッシュから読み込み: {len(data['symbols'])}銘柄")
             return data
         except Exception as e:
-            logging.warning(f"\u9298\u67c4\u30ea\u30b9\u30c8\u30ad\u30e3\u30c3\u30b7\u30e5\u8aad\u307f\u8fbc\u307f\u5931\u6557: {e}")
+            logging.warning(f"銘柄リストキャッシュ読み込み失敗: {e}")
             return None
 
     def _save_symbols_cache(self, symbols: list[str], names: dict[str, str]) -> None:
@@ -237,6 +322,6 @@ class StockScreener:
                     f,
                     ensure_ascii=False,
                 )
-            logging.info(f"\u9298\u67c4\u30ea\u30b9\u30c8\u3092\u30ad\u30e3\u30c3\u30b7\u30e5\u306b\u4fdd\u5b58: {len(symbols)}\u9298\u67c4")
+            logging.info(f"銘柄リストをキャッシュに保存: {len(symbols)}銘柄")
         except Exception as e:
-            logging.warning(f"\u9298\u67c4\u30ea\u30b9\u30c8\u30ad\u30e3\u30c3\u30b7\u30e5\u4fdd\u5b58\u5931\u6557: {e}")
+            logging.warning(f"銘柄リストキャッシュ保存失敗: {e}")
